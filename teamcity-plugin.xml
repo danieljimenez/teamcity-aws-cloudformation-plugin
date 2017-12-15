@@ -24,8 +24,8 @@
         <description>Build runner for creating AWS CloudFormation stacks</description>
         <download-url></download-url>
         <vendor>
-            <name>sjey</name>
-            <url>https://github.com/sjey/teamcity-aws-cloudformation-plugin</url>
+            <name>ForeFlight</name>
+            <url>https://github.com/foreflight/teamcity-aws-cloudformation-plugin</url>
         </vendor>
     </info>
     <deployment use-separate-classloader="true"/>

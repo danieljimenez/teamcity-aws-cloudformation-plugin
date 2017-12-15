@@ -27,9 +27,9 @@ import java.util.Map;
 public class AWSException extends RuntimeException {
 
   // "ELASTICBEANSTALK_" prefix is for backward compatibility
-  public static String SERVICE_PROBLEM_TYPE = "ELASTICBEANSTALK_SERVICE";
-  public static String CLIENT_PROBLEM_TYPE = "ELASTICBEANSTALK_CLIENT";
-  public static String EXCEPTION_BUILD_PROBLEM_TYPE = "ELASTICBEANSTALK_EXCEPTION";
+  public static String SERVICE_PROBLEM_TYPE = "CLOUDFORMATION_SERVICE";
+  public static String CLIENT_PROBLEM_TYPE = "CLOUDFORMATION_CLIENT";
+  public static String EXCEPTION_BUILD_PROBLEM_TYPE = "CLOUDFORMATION_EXCEPTION";
 
   public static Map<String, String> PROBLEM_TYPES = CollectionsUtil.asMap(
       SERVICE_PROBLEM_TYPE, "Amazon service exception",

@@ -16,6 +16,7 @@
 
 package jetbrains.buildServer.runner.cloudformation;
 
+import com.amazonaws.AmazonClientException;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
 import com.amazonaws.services.cloudformation.AmazonCloudFormationClient;
@@ -24,416 +25,344 @@ import com.amazonaws.services.cloudformation.model.DeleteStackRequest;
 import com.amazonaws.services.cloudformation.model.DescribeStackEventsRequest;
 import com.amazonaws.services.cloudformation.model.DescribeStackEventsResult;
 import com.amazonaws.services.cloudformation.model.DescribeStacksRequest;
+import com.amazonaws.services.cloudformation.model.DescribeStacksResult;
+import com.amazonaws.services.cloudformation.model.Parameter;
 import com.amazonaws.services.cloudformation.model.Stack;
 import com.amazonaws.services.cloudformation.model.StackEvent;
 import com.amazonaws.services.cloudformation.model.StackStatus;
 import com.amazonaws.services.cloudformation.model.UpdateStackRequest;
 import com.amazonaws.services.cloudformation.model.ValidateTemplateRequest;
-
 import jetbrains.buildServer.util.amazon.AWSClients;
 import jetbrains.buildServer.util.amazon.AWSException;
-
-import java.util.ArrayList;
-import java.util.List;
-
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.joda.time.Seconds;
 
-public class AWSClient {
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
 
-	@NotNull
-	private AmazonCloudFormationClient myCloudFormationClient;
-	@Nullable
-	private String myDescription;
-	@NotNull
-	private Listener myListener = new Listener();
+class AWSClient {
 
-	public AWSClient(@NotNull AWSClients clients) {
-		myCloudFormationClient = clients.createCloudFormationClient();
-	}
+    @NotNull
+    private AmazonCloudFormationClient myCloudFormationClient;
+    @NotNull
+    private Listener myListener = new Listener();
 
-	@NotNull
-	public AWSClient withDescription(@NotNull String description) {
-		myDescription = description;
-		return this;
-	}
+    AWSClient(@NotNull AWSClients clients) {
+        myCloudFormationClient = clients.createCloudFormationClient();
+    }
 
-	@NotNull
-	public AWSClient withListener(@NotNull Listener listener) {
-		myListener = listener;
-		return this;
-	}
+    @NotNull
+    AWSClient withDescription(@NotNull String description) {
+        return this;
+    }
 
-	/**
-	 * Uploads application revision archive to S3 bucket named s3BucketName with
-	 * the provided key and bundle type.
-	 * <p>
-	 * For performing this operation target AWSClient must have corresponding S3
-	 * permissions.
-	 *
-	 * @param s3BucketName
-	 *            valid S3 bucket name
-	 * @param s3ObjectKey
-	 *            valid S3 object key
-	 */
-	public void initiateCFN(@NotNull String stackName, @NotNull String region, @NotNull String s3BucketName,
-			@NotNull String s3ObjectKey, @NotNull String cfnAction, @NotNull String onFailure) {
-		try {
-			String templateURL;
-			Region reg = Region.getRegion(Regions.fromName(region));
-			myCloudFormationClient.setRegion(reg);
-			templateURL = getTemplateUrl(reg, s3BucketName, s3ObjectKey);
-			System.out.println("The template url is " + templateURL);
+    @NotNull
+    AWSClient withListener(@NotNull Listener listener) {
+        myListener = listener;
+        return this;
+    }
 
-			if (cfnAction.equalsIgnoreCase("Create")) {
-				System.out.println("The CFN action is " + cfnAction);
-				myListener.createStackStarted(stackName, region, s3BucketName, s3ObjectKey, cfnAction);
-				CreateStackRequest createRequest = new CreateStackRequest();
-				createRequest.setStackName(stackName);
-				if (!onFailure.equalsIgnoreCase("null"))
-					createRequest.setOnFailure(onFailure);
-				createRequest.setTemplateURL(templateURL);
-				myCloudFormationClient.createStack(createRequest);
-				waitForCompletion(myCloudFormationClient, stackName);
+    /**
+     * Uploads application revision archive to S3 bucket named s3BucketName with
+     * the provided key and bundle type.
+     * <p>
+     * For performing this operation target AWSClient must have corresponding S3
+     * permissions.
+     */
+    void initiateCFN(@NotNull String stackName,
+                     @NotNull String region,
+                     @NotNull String s3BucketName,
+                     @NotNull String s3ObjectKey,
+                     @NotNull String cfnAction,
+                     @NotNull String onFailure,
+                     @NotNull Map<String, String> systemProperties
+    ) {
+        try {
+            Region reg = Region.getRegion(Regions.fromName(region));
+            myCloudFormationClient.setRegion(reg);
 
-			} else if (cfnAction.equalsIgnoreCase("Delete")) {
-				myListener.deleteStarted(stackName, region);
-				DeleteStackRequest deleteStackRequest = new DeleteStackRequest();
-				deleteStackRequest.setStackName(stackName);
-				myCloudFormationClient.deleteStack(deleteStackRequest);
-				waitForDelete(myCloudFormationClient, stackName);
+            String templateURL;
+            templateURL = getTemplateUrl(reg, s3BucketName, s3ObjectKey);
 
-			} else if (cfnAction.equalsIgnoreCase("Validate")) {
-				myListener.validateStarted(stackName);
-				ValidateTemplateRequest validatetempRequest = new ValidateTemplateRequest();
-				validatetempRequest.setTemplateURL(templateURL);
-				myListener.validateFinished(
-						myCloudFormationClient.validateTemplate(validatetempRequest).getParameters().toString());
+            if (cfnAction.equalsIgnoreCase("Create") || cfnAction.equalsIgnoreCase("Update")) {
+                ArrayList<String> capabilities = new ArrayList<>();
+                capabilities.add("CAPABILITY_NAMED_IAM");
 
-			} else if (cfnAction.equalsIgnoreCase("Update")) {
-				myListener.updateInProgress(stackName);
-				UpdateStackRequest updateStackRequest = new UpdateStackRequest();
-				updateStackRequest.setStackName(stackName);
-				updateStackRequest.setTemplateURL(templateURL);
-				myCloudFormationClient.updateStack(updateStackRequest);
-				waitForCompletion(myCloudFormationClient, stackName);
-			}
-		} catch (Throwable t) {
-			processFailure(t);
-		}
-	}
+                if (doesStackExist(stackName)) {
+                    myListener.updateInProgress(stackName);
 
-	public void waitForCompletion(AmazonCloudFormationClient stackbuilder, String stackName)
-			throws InterruptedException {
-		DescribeStacksRequest wait = new DescribeStacksRequest();
-		wait.setStackName(stackName);
-		Boolean completed = false;
-		String action = "CREATE";
-		String stackStatus = "Waiting";
-		String stackReason = "";
-		String stackId = "";
-		List<String> events;
-		int len, first, last;
+                    UpdateStackRequest updateStackRequest = new UpdateStackRequest();
+                    updateStackRequest.setStackName(stackName);
+                    updateStackRequest.setTemplateURL(templateURL);
 
-		first = 0;
+                    List<Parameter> parameters = convertSystemProperties(systemProperties);
+                    updateStackRequest.setParameters(parameters);
+                    updateStackRequest.setCapabilities(capabilities);
 
-		myListener.waitForStack(stackStatus);
+                    myCloudFormationClient.updateStack(updateStackRequest);
+                    waitForCompletion(myCloudFormationClient, stackName);
+                } else {
+                    myListener.createStackStarted(stackName, region, s3BucketName, s3ObjectKey, cfnAction);
+                    CreateStackRequest createRequest = new CreateStackRequest();
 
-		while (!completed) {
-			List<Stack> stacks = stackbuilder.describeStacks(wait).getStacks();
-			if (stacks.isEmpty()) {
-				completed = true;
-				stackStatus = "NO_SUCH_STACK";
-				stackReason = "Stack has been deleted";
-			} else {
-				for (Stack stack : stacks) {
-					if (stack.getStackStatus().equals(StackStatus.CREATE_COMPLETE.toString())
-							|| stack.getStackStatus().equals(StackStatus.CREATE_FAILED.toString())
-							|| stack.getStackStatus().equals(StackStatus.ROLLBACK_FAILED.toString())
-							|| stack.getStackStatus().equals(StackStatus.DELETE_FAILED.toString())) {
-						completed = true;
-						stackStatus = stack.getStackStatus();
-						if (stack.getStackStatus().equals(StackStatus.CREATE_COMPLETE.toString())) {
-							stackReason = "Success";
-						} else {
-							stackReason = "Failure";
-						}
-						stackId = stack.getStackId();
-					}
-				}
-			}
-			//sleep for 10 seconds
-			Thread.sleep(10000);
-		}
-		
-		if (completed) {
-			events = describeStackEvents(stackbuilder, stackName, action);
-			for (String event : events) {
-				myListener.waitForStack(event.toString());
-			}
-			events.clear();
+                    createRequest.setStackName(stackName);
+                    createRequest.setTemplateURL(templateURL);
+                    createRequest.setOnFailure(onFailure);
 
-		}
-		myListener.waitForStack(stackStatus);
-		if (stackReason.contains("Failure")) {
-			myListener.createStackFailed(stackName, stackStatus, stackReason);
-		} else {
-			myListener.createStackFinished(stackName, stackStatus);
-		}
-	}
+                    List<Parameter> parameters = convertSystemProperties(systemProperties);
+                    createRequest.setParameters(parameters);
+                    createRequest.setCapabilities(capabilities);
 
-	public void waitForDelete(AmazonCloudFormationClient stackbuilder, String stackName) throws InterruptedException {
-		DescribeStacksRequest wait = new DescribeStacksRequest();
-		wait.setStackName(stackName);
-		String stackStatus;
-		String stackReason;
-		String action = "DELETE";
-		Boolean delete = false;
-		List<String> events;
+                    myCloudFormationClient.createStack(createRequest);
+                    waitForCompletion(myCloudFormationClient, stackName);
+                }
 
-		while (!delete) {
+            } else if (cfnAction.equalsIgnoreCase("Delete")) {
+                myListener.deleteStarted(stackName, region);
+                DeleteStackRequest deleteStackRequest = new DeleteStackRequest();
+                deleteStackRequest.setStackName(stackName);
+                myCloudFormationClient.deleteStack(deleteStackRequest);
+                waitForDelete(myCloudFormationClient, stackName);
 
-			List<Stack> stacks = stackbuilder.describeStacks(wait).getStacks();
-			if (stacks.isEmpty()) {
-				delete = true;
-				stackStatus = "NO_SUCH_STACK";
-				stackReason = "Stack has been deleted";
-			} else {
-				myListener.debugLog("From the wait for delete");
-				events = describeStackEvents(stackbuilder, stackName, action);
-				for (String event : events) {
-					myListener.waitForStack(event.toString());
-				}
-				Thread.sleep(10000);
-				events.clear();
-			}
-		}
-		stackStatus = "done";
-		stackReason = "Delete Complete";
-		myListener.waitForStack(stackStatus);
-		myListener.createStackFinished(stackName, stackStatus);
-	}
+            } else if (cfnAction.equalsIgnoreCase("Validate")) {
+                myListener.validateStarted(stackName);
+                ValidateTemplateRequest validatetempRequest = new ValidateTemplateRequest();
+                validatetempRequest.setTemplateURL(templateURL);
+                myListener.validateFinished(myCloudFormationClient.validateTemplate(validatetempRequest).getParameters().toString());
+            }
+        } catch (Throwable t) {
+            processFailure(t);
+        }
+    }
 
-	public List<String> describeStackEvents(AmazonCloudFormationClient stackbuilder, String stackName, String ACTION) {
-		List<String> output = new ArrayList<String>();
-		DescribeStackEventsRequest request = new DescribeStackEventsRequest();
-		request.setStackName(stackName);
-		DescribeStackEventsResult results = stackbuilder.describeStackEvents(request);
-		for (StackEvent event : results.getStackEvents()) {
-			if (event.getEventId().contains(ACTION)) {
+    private boolean doesStackExist(@NotNull String stackName) {
+        DescribeStacksRequest dsr = new DescribeStacksRequest();
+        dsr.setStackName(stackName);
+        try {
+            DescribeStacksResult describeStacksResult;
+            describeStacksResult = myCloudFormationClient.describeStacks(dsr);
+            if (describeStacksResult.getStacks().isEmpty()) {
+                return false;
+            } else {
+                boolean stackExists = false;
+                for (Stack stack : describeStacksResult.getStacks()) {
+                    if (statusIsCompleted(stack.getStackStatus())) {
+                        stackExists = true;
+                    }
+                }
+                return stackExists;
+            }
+        } catch (AmazonClientException ignored) {
+            return false;
+        }
+    }
 
-				output.add(event.getEventId());
-				// myListener.debugLog(event.toString());
-			}
-		}
-		return output;
-	}
+    @NotNull
+    private List<Parameter> convertSystemProperties(@NotNull Map<String, String> configParameters) {
+        List<Parameter> parameters = new ArrayList<>();
+        for (String s : configParameters.keySet()) {
+            if (s.startsWith("cloudformation.")) {
+                String key = s.split("cloudformation\\.")[1];
+                Parameter parameter = new Parameter();
+                parameter.setParameterKey(key);
+                parameter.setParameterValue(configParameters.get(s));
+                parameters.add(parameter);
+            }
+        }
+        return parameters;
+    }
 
-	public String getTemplateUrl(Region region, String s3Bucket, String s3Object) {
-		// "https://s3-us-west-2.amazonaws.com/" + s3BucketName + "/" +
-		// s3ObjectKey;
-		String templateUrl;
-		// hard coded s3 bucket location
-		// templateUrl = "https://s3-ap-southeast-2.amazonaws.com" + "/" + s3Bucket + "/" + s3Object;
-		templateUrl = "https://" + region.getServiceEndpoint("s3") + "/" +  s3Bucket + "/" + s3Object;
-		return templateUrl;
-	}
+    private void waitForCompletion(AmazonCloudFormationClient stackbuilder, String stackName)
+            throws InterruptedException {
+        DescribeStacksRequest wait = new DescribeStacksRequest();
+        wait.setStackName(stackName);
+        Boolean completed = false;
+        String stackStatus = "";
+        String stackReason = "";
 
-	public Boolean isStackExists(@NotNull String stackName) {
-		Boolean exists;
-		DescribeStacksRequest wait = new DescribeStacksRequest();
-		wait.setStackName(stackName);
-		return true;
-	}
+        while (!completed) {
+            List<Stack> stacks = stackbuilder.describeStacks(wait).getStacks();
+            if (stacks != null) {
+                if (!stacks.isEmpty()) {
+                    for (Stack stack : stacks) {
+                        stackStatus = stack.getStackStatus();
+                        if (statusIsCompleted(stackStatus)) {
+                            completed = true;
 
-	// public void updateEnvironmentAndWait(@NotNull String environmentName,
-	// @NotNull String versionLabel,
-	// int waitTimeoutSec, int waitIntervalSec) {
-	// doUpdateAndWait(environmentName, versionLabel, true, waitTimeoutSec,
-	// waitIntervalSec);
-	// }
-	//
-	// /**
-	// * The same as {@link #updateEnvironmentAndWait} but without waiting
-	// */
-	// public void updateEnvironment(@NotNull String environmentName, @NotNull
-	// String versionLabel) {
-	// doUpdateAndWait(environmentName, versionLabel, false, null, null);
-	// }
+                            if (stackStatus.equals(StackStatus.CREATE_COMPLETE.toString())) {
+                                stackReason = "SUCCESS";
+                            } else {
+                                stackReason = "FAILURE";
+                            }
+                        }
+                    }
+                } else {
+                    completed = true;
+                    stackStatus = "NO_SUCH_STACK";
+                    stackReason = "FAILURE";
+                }
+            } else {
+                completed = true;
+                stackStatus = "NO_SUCH_STACK";
+                stackReason = "FAILURE";
+            }
 
-	// @SuppressWarnings("ConstantConditions")
-	// private void doUpdateAndWait(@NotNull String environmentName, @NotNull
-	// String versionLabel,
-	// boolean wait, @Nullable Integer waitTimeoutSec, @Nullable Integer
-	// waitIntervalSec) {
-	// try {
-	// UpdateEnvironmentRequest request = new UpdateEnvironmentRequest()
-	// .withEnvironmentName(environmentName)
-	// .withVersionLabel(versionLabel);
-	// UpdateEnvironmentResult result =
-	// myCloudFormationClient.updateEnvironment(request);
-	//
-	// String environmentId = result.getEnvironmentId();
-	//
-	// myListener.deploymentStarted(environmentId, environmentName,
-	// versionLabel);
-	//
-	// if (wait) {
-	// waitForDeployment(environmentId, versionLabel, waitTimeoutSec,
-	// waitIntervalSec);
-	// }
-	// } catch (Throwable t) {
-	// processFailure(t);
-	// }
-	// }
+            myListener.waitForStack(stackStatus);
+            Seconds seconds = Seconds.ONE.multipliedBy(5);
+            Thread.sleep(seconds.toStandardDuration().getMillis());
+        }
 
-	// private void waitForDeployment(@NotNull String environmentId, String
-	// versionLabel, int waitTimeoutSec, int waitIntervalSec) {
-	// myListener.deploymentWaitStarted(environmentId);
-	//
-	// EnvironmentDescription environment = getEnvironment(environmentId);
-	// String status = getHumanReadableStatus(environment.getStatus());
-	// List<EventDescription> events = getErrorEvents(environmentId,
-	// versionLabel);
-	// boolean hasError = events.size() > 0;
-	//
-	// long startTime = System.currentTimeMillis();
-	//
-	// while (status.equals("updating") && !hasError) {
-	// myListener.deploymentInProgress(environmentId);
-	//
-	// if (System.currentTimeMillis() - startTime > waitTimeoutSec * 1000) {
-	// myListener.deploymentFailed(environmentId,
-	// environment.getApplicationName(), versionLabel, true, null);
-	// return;
-	// }
-	//
-	// try {
-	// Thread.sleep(waitIntervalSec * 1000);
-	// } catch (InterruptedException e) {
-	// processFailure(e);
-	// return;
-	// }
-	//
-	// environment = getEnvironment(environmentId);
-	// status = getHumanReadableStatus(environment.getStatus());
-	// events = getErrorEvents(environmentId, versionLabel);
-	// hasError = events.size() > 0;
-	// }
-	//
-	// if (isSuccess(environment, versionLabel)) {
-	// myListener.deploymentSucceeded(environmentId,
-	// environment.getApplicationName(), versionLabel);
-	// } else {
-	// Listener.ErrorInfo errorEvent = events.size() > 0 ?
-	// getErrorInfo(events.get(0)) : null;
-	// myListener.deploymentFailed(environmentId,
-	// environment.getApplicationName(), versionLabel, false, errorEvent);
-	// }
-	// }
+        myListener.waitForStack(stackStatus);
 
-	// public EnvironmentDescription getEnvironment(@NotNull String
-	// environmentId) {
-	// return myCloudFormationClient.describeEnvironments(new
-	// DescribeEnvironmentsRequest().withEnvironmentIds(environmentId))
-	// .getEnvironments().get(0);
-	// }
-	//
-	// private List<EventDescription> getErrorEvents(@NotNull String
-	// environmentId, String versionLabel) {
-	// return myCloudFormationClient.describeEvents(new DescribeEventsRequest()
-	// .withEnvironmentId(environmentId)
-	// .withMaxRecords(10)
-	// .withVersionLabel(versionLabel)
-	// .withSeverity(EventSeverity.ERROR))
-	// .getEvents();
-	// }
+        if (stackReason.contains("Failure")) {
+            myListener.createStackFailed(stackName, stackStatus, stackReason);
+        } else {
+            myListener.createStackFinished(stackName, stackStatus);
+        }
+    }
 
-	// private boolean isSuccess(@NotNull EnvironmentDescription environment,
-	// @NotNull String versionLabel) {
-	// return environment.getVersionLabel().equals(versionLabel);
-	// }
+    private boolean statusIsCompleted(String status) {
+        TreeSet<String> acceptableValues = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        acceptableValues.add(StackStatus.CREATE_COMPLETE.toString());
+        acceptableValues.add(StackStatus.CREATE_FAILED.toString());
+        acceptableValues.add(StackStatus.ROLLBACK_FAILED.toString());
+        acceptableValues.add(StackStatus.ROLLBACK_COMPLETE.toString());
+        acceptableValues.add(StackStatus.UPDATE_COMPLETE.toString());
+        acceptableValues.add(StackStatus.UPDATE_ROLLBACK_COMPLETE.toString());
+        acceptableValues.add(StackStatus.UPDATE_ROLLBACK_FAILED.toString());
+        acceptableValues.add(StackStatus.DELETE_FAILED.toString());
+        return acceptableValues.contains(status);
+    }
 
-	private void processFailure(@NotNull Throwable t) {
-		myListener.exception(new AWSException(t));
-	}
+    private void waitForDelete(AmazonCloudFormationClient stackbuilder, String stackName) throws InterruptedException {
+        DescribeStacksRequest wait = new DescribeStacksRequest();
+        wait.setStackName(stackName);
+        String stackStatus;
+        String action = "DELETE";
+        Boolean delete = false;
+        List<String> events;
 
-	@NotNull
-	private String getHumanReadableStatus(@NotNull String status) {
-		if (StackStatus.CREATE_IN_PROGRESS.toString().equals(status))
-			return "launching";
-		if (StackStatus.UPDATE_IN_PROGRESS.toString().equals(status))
-			return "updating";
-		if (StackStatus.CREATE_COMPLETE.toString().equals(status))
-			return "ready";
-		if (StackStatus.DELETE_COMPLETE.toString().equals(status))
-			return "terminated";
-		if (StackStatus.DELETE_IN_PROGRESS.toString().equals(status))
-			return "terminating";
-		return CloudFormationConstants.STATUS_IS_UNKNOWN;
-	}
+        while (!delete) {
+            List<Stack> stacks = stackbuilder.describeStacks(wait).getStacks();
+            if (stacks.isEmpty()) {
+                delete = true;
+                stackStatus = "NO_SUCH_STACK";
+            } else {
+                myListener.debugLog("From the wait for delete");
+                events = describeStackEvents(stackbuilder, stackName, action);
+                for (String event : events) {
+                    myListener.waitForStack(event);
+                }
+                Thread.sleep(10000);
+                events.clear();
+            }
+        }
+        stackStatus = "done";
+        myListener.waitForStack(stackStatus);
+        myListener.createStackFinished(stackName, stackStatus);
+    }
 
-	@NotNull
-	// private Listener.ErrorInfo getErrorInfo(@NotNull EventDescription event)
-	// {
-	// final Listener.ErrorInfo errorInfo = new Listener.ErrorInfo();
-	// errorInfo.message = removeTrailingDot(event.getMessage());
-	// errorInfo.severity = event.getSeverity();
-	// return errorInfo;
-	// }
+    private List<String> describeStackEvents(AmazonCloudFormationClient stackbuilder, String stackName, String ACTION) {
+        List<String> output = new ArrayList<String>();
+        DescribeStackEventsRequest request = new DescribeStackEventsRequest();
+        request.setStackName(stackName);
+        DescribeStackEventsResult results = stackbuilder.describeStackEvents(request);
+        for (StackEvent event : results.getStackEvents()) {
+            if (event.getEventId().contains(ACTION)) {
 
-	@Contract("null -> null")
-	@Nullable
-	private String removeTrailingDot(@Nullable String msg) {
-		return (msg != null && msg.endsWith(".")) ? msg.substring(0, msg.length() - 1) : msg;
-	}
+                output.add(event.getEventId());
+                // myListener.debugLog(event.toString());
+            }
+        }
+        return output;
+    }
 
-	public static class Listener {
+    private String getTemplateUrl(Region region, String s3Bucket, String s3Object) {
+        String templateUrl;
+        templateUrl = "https://" + region.getServiceEndpoint("s3") + "/" + s3Bucket + "/" + s3Object;
+        return templateUrl;
+    }
 
-		void createStackStarted(@NotNull String stackName, @NotNull String region, @NotNull String s3BucketName,
-				@NotNull String s3ObjectKey, @NotNull String cfnAction) {
-		}
+    private void processFailure(@NotNull Throwable t) {
+        myListener.exception(new AWSException(t));
+    }
 
-		void debugLog(String status) {
-		}
+    @NotNull
+    private String getHumanReadableStatus(@NotNull String status) {
+        if (StackStatus.CREATE_IN_PROGRESS.toString().equals(status))
+            return "launching";
+        if (StackStatus.UPDATE_IN_PROGRESS.toString().equals(status))
+            return "updating";
+        if (StackStatus.CREATE_COMPLETE.toString().equals(status))
+            return "ready";
+        if (StackStatus.DELETE_COMPLETE.toString().equals(status))
+            return "terminated";
+        if (StackStatus.DELETE_IN_PROGRESS.toString().equals(status))
+            return "terminating";
+        return CloudFormationConstants.STATUS_IS_UNKNOWN;
+    }
 
-		void createStackFailed(@NotNull String stackName, @NotNull String stackStatus, @NotNull String stackReason) {
-		}
+    @Contract("null -> null")
+    @Nullable
+    private String removeTrailingDot(@Nullable String msg) {
+        return (msg != null && msg.endsWith(".")) ? msg.substring(0, msg.length() - 1) : msg;
+    }
 
-		void createStackFinished(@NotNull String stackName, @NotNull String stackStatus) {
-		}
+    static class Listener {
 
-		void waitForStack(@NotNull String status) {
-		}
+        void createStackStarted(@NotNull String stackName,
+                                @NotNull String region,
+                                @NotNull String s3BucketName,
+                                @NotNull String s3ObjectKey,
+                                @NotNull String cfnAction) {
+        }
 
-		void deleteStarted(@NotNull String stackName, @NotNull String region) {
-		}
+        void debugLog(String status) {
+        }
 
-		void deleteSucceeded(@NotNull String stackName) {
-		}
+        void createStackFailed(@NotNull String stackName, @NotNull String stackStatus, @NotNull String stackReason) {
+        }
 
-		void validateStarted(@NotNull String stackName) {
-		}
+        void createStackFinished(@NotNull String stackName, @NotNull String stackStatus) {
+        }
 
-		void validateFinished(@NotNull String parameters) {
-		}
+        void waitForStack(@NotNull String status) {
+        }
 
-		void updateInProgress(@NotNull String stackName) {
-		}
+        void deleteStarted(@NotNull String stackName, @NotNull String region) {
+        }
 
-		void exception(@NotNull AWSException exception) {
-		}
+        void deleteSucceeded(@NotNull String stackName) {
+        }
 
-		void deploymentFailed(@NotNull String environmentId, @NotNull String applicationName,
-				@NotNull String versionLabel, @NotNull Boolean hasTimeout, @Nullable ErrorInfo errorInfo) {
-		}
+        void validateStarted(@NotNull String stackName) {
+        }
 
-		public static class ErrorInfo {
-			@Nullable
-			String severity;
-			@Nullable
-			String message;
-		}
-	}
+        void validateFinished(@NotNull String parameters) {
+        }
+
+        void updateInProgress(@NotNull String stackName) {
+        }
+
+        void exception(@NotNull AWSException exception) {
+        }
+
+        void deploymentFailed(@NotNull String environmentId,
+                              @NotNull String applicationName,
+                              @NotNull String versionLabel,
+                              @NotNull Boolean hasTimeout,
+                              @Nullable ErrorInfo errorInfo) {
+        }
+
+        static class ErrorInfo {
+            @Nullable
+            String severity;
+            @Nullable
+            String message;
+        }
+    }
 }

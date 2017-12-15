@@ -17,12 +17,16 @@
 package jetbrains.buildServer.runner.cloudformation;
 
 import jetbrains.buildServer.RunBuildException;
+import jetbrains.buildServer.agent.AgentBuildRunner;
+import jetbrains.buildServer.agent.AgentBuildRunnerInfo;
+import jetbrains.buildServer.agent.AgentRunningBuild;
+import jetbrains.buildServer.agent.BuildAgentConfiguration;
+import jetbrains.buildServer.agent.BuildFinishedStatus;
+import jetbrains.buildServer.agent.BuildProcess;
+import jetbrains.buildServer.agent.BuildRunnerContext;
 import jetbrains.buildServer.messages.ErrorData;
-import jetbrains.buildServer.agent.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-
-import com.amazonaws.regions.Region;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -58,7 +62,7 @@ public class CloudFormationRunner implements AgentBuildRunner {
         final String onFailure = runnerParameters.get(ONFAILURE_PARAM);
 
         if (!m.problemOccurred && !isInterrupted()) {
-          awsClient.initiateCFN(stackName, region, s3BucketName, s3ObjectKey, cfnAction, onFailure);
+          awsClient.initiateCFN(stackName, region, s3BucketName, s3ObjectKey, cfnAction, onFailure, context.getBuildParameters().getSystemProperties());
         }
         
         return m.problemOccurred ? BuildFinishedStatus.FINISHED_WITH_PROBLEMS : BuildFinishedStatus.FINISHED_SUCCESS;
